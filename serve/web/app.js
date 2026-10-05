@@ -89,12 +89,17 @@ window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 function headers(json = false) {
   const h = {};
   const key = store.get("apikey", "");
-  if (key) h.Authorization = "Bearer " + key;
+  // #725: a header takes bytes only, so a key outside Latin-1 made fetch() throw; the server reads it as UTF-8
+  if (key) h.Authorization = "Bearer " + String.fromCharCode(...new TextEncoder().encode(key));
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); keyWarned = false; toast("success", "API key saved", "Kept in this browser only."); };
+// #725: a saved key the server refuses is a wrong key, not a missing one
+const keyNote = () => store.get("apikey", "")
+  ? {pill: "API key not accepted", text: "The server refused the saved key: check it under About > Settings."}
+  : {pill: "API key needed", text: "This server needs an API key: add it under About > Settings."};
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
@@ -156,8 +161,8 @@ async function poll() {
   try {
     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
-      setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      setPill("error", keyNote().pill);
+      if (!keyWarned) { keyWarned = true; toast("warn", keyNote().pill, keyNote().text, 6000); }
     } else if (r.ok) {
       lastMetrics = await r.json();
       metricsFailures = 0;
@@ -795,7 +800,7 @@ async function send() {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = keyNote().text;
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
