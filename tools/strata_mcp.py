@@ -22,7 +22,9 @@ This file is an MCP *server* for the AI assistant you already use.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import platform
@@ -425,6 +427,16 @@ class Strata:
             return s.MODELS, s.FAMILIES, list(s.CONTEXTS), "setup.py"
         return FALLBACK_MODELS, FALLBACK_FAMILIES, FALLBACK_CONTEXTS, "built-in table (setup.py not importable)"
 
+    def amd_images(self, vision) -> str:
+        """What setup does with --vision on an AMD card: "cpu" (the CPU image encoder) or "none" (images off).  It is
+        setup.py's own hip_vision, so the plan and setup cannot disagree (#990); the same rule built in when setup.py
+        is not importable."""
+        S = self.setup_module()
+        if S is not None and hasattr(S, "hip_vision"):
+            with contextlib.redirect_stdout(io.StringIO()):     # its warning is for setup's console
+                return S.hip_vision(vision)
+        return "cpu" if vision == "cpu" and not WIN else "none"
+
     @staticmethod
     def sizes_of(models, family) -> list:
         """The family's sizes as setup lists them: an experimental one last (never the default)."""
@@ -625,18 +637,19 @@ class Strata:
                 g["problem"] = None
             g["usable"] = g["problem"] is None
         amd = []
-        if not WIN:
-            try:
-                amd = S.amd_gpus() if S else []
-                for g in amd:
-                    g["vendor"] = "amd"
-                    g["vram_gb"] = round(g["vram_gb"], 1)
-                    g["problem"] = S.amd_problem(g)
-                    g["usable"] = g["problem"] is None
-            except Exception:                           # noqa: BLE001
-                amd = []
-            if not amd and shutil.which("rocm-smi"):
-                amd = rocm_smi_gpus()
+        try:
+            # Windows (0.1.34): the display adapters, as setup lists them before the AMD engine is installed.  Not
+            # amd_gpus(): with an AMD engine here that runs it and copies its runtime files, and this only looks.
+            amd = (S.amd_gpus_windows() if WIN else S.amd_gpus()) if S else []
+            for g in amd:
+                g["vendor"] = "amd"
+                g["vram_gb"] = round(g["vram_gb"], 1)
+                g["problem"] = S.amd_problem(g)
+                g["usable"] = g["problem"] is None
+        except Exception:                               # noqa: BLE001
+            amd = []
+        if not WIN and not amd and shutil.which("rocm-smi"):
+            amd = rocm_smi_gpus()
         hw["gpus"] = nv + amd
         if WIN:
             hw["display_adapters"] = windows_video_controllers()
@@ -652,8 +665,11 @@ class Strata:
         usable = [g for g in hw.get("gpus", []) if g.get("usable")]
         ram = hw.get("ram_gb") or 0
         if not usable:
+            amd = [g for g in hw.get("gpus", []) if g.get("vendor") == "amd" and g.get("problem")]
             why = ("no NVIDIA RTX 20-series-or-newer GPU found (nvidia-smi did not list one)"
-                   + ("; AMD cards run on Linux only" if WIN and any(
+                   + "".join(f"; {g.get('name')}: {g['problem']}" for g in amd)
+                   + ("; the AMD card Windows lists could not be checked (START-HERE.bat --check does)"
+                      if WIN and not amd and any(
                        "amd" in str(a.get("name", "")).lower() or "radeon" in str(a.get("name", "")).lower()
                        for a in hw.get("display_adapters", [])) else ""))
             return {"family": None, "model": None, "why": why}
@@ -688,7 +704,11 @@ class Strata:
             notes.append("this CPU has no AVX2: EXPERIMENTAL and slow - setup compiles the engine on this PC for the "
                          "older CPU (10-20 minutes), and the CPU's share of the experts runs a few times slower")
         if backend == "hip":
-            notes.append("AMD (experimental, Linux): the engine is compiled during setup; no images")
+            notes.append("AMD (experimental): "
+                         + ("setup downloads the ready-made AMD engine; one card per model" if WIN else
+                            "the engine is compiled during setup")
+                         + ("; images only on the CPU (vision=cpu)" if self.amd_images("cpu") == "cpu" else
+                            "; no images"))
         cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
                f" --yes --family {fam} --model {model} --context {ctx}" + (" --backend hip" if backend == "hip" else ""))
         return {"family": fam, "model": model, "title": families[fam]["title"] + " " + model, "context": ctx,
@@ -968,7 +988,7 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                          "description": "context length in tokens (more needs more VRAM)"},
              "vision": {"type": "string", "enum": ["no", "yes", "gpu", "cpu"],
                         "description": "let the model read images (yes = the encoder on the GPU; ~0.9 GB more "
-                                       "download); default no"},
+                                       "download; an AMD card: cpu, on Linux); default no"},
              "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4"],
                     "description": "KV cache precision above 8K context (default int8)"},
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
@@ -976,7 +996,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "gpus": {"type": "string", "pattern": GPUS_PATTERN, "maxLength": 40,
                       "description": "several GPUs sharing the model: '0,2' or 'all' (experimental)"},
              "backend": {"type": "string", "enum": ["auto", "cuda", "hip"],
-                         "description": "auto (default), cuda = NVIDIA, hip = AMD on Linux (experimental)"},
+                         "description": "auto (default), cuda = NVIDIA, hip = AMD (experimental; Linux: compiled "
+                                        "during setup, Windows: a ready-made engine)"},
              "low_ram": {"type": "string", "enum": ["auto", "on", "off", "resident", "mmap"],
                          "description": "setup's low-RAM mode (default auto)"},
              "port": {**port, "description": "the port the model will listen on (default 8080)"},
@@ -1204,9 +1225,6 @@ class Tools:
         models, families, contexts, _src = s.tables()
         if gpu is not None and gpus is not None:
             raise ToolError("give gpu (one card) or gpus (several), not both")
-        if backend == "hip" and WIN:
-            raise ToolError("the AMD (hip) backend runs on Linux only; on Windows Strata needs an NVIDIA RTX 20 "
-                            "series or newer card")
         if sys.version_info < (3, 10) or (WIN and sys.maxsize <= 2**32):
             raise ToolError("this Python is too old or 32-bit: Strata's setup needs 64-bit Python 3.10+; run "
                             + ("START-HERE.bat" if WIN else "./setup.sh") + " once instead (it installs Python)")
@@ -1227,16 +1245,25 @@ class Tools:
         sizes = s.sizes_of(models, family)
         if model not in sizes:
             raise ToolError(f"{families[family]['title']} has no {model}; its sizes: {', '.join(sizes)}")
+        usable = [g for g in hw.get("gpus", []) if g.get("usable")]
         if context is None:
-            usable = [g for g in hw.get("gpus", []) if g.get("usable")]
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
             if models[model].get("budget"):
                 context = 8192 if vram < 14 else 32768
         if vision in ("yes", "gpu", "cpu") and models[model].get("vision", families[family].get("vision")) is False:
             raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
-        if vision is not None and backend == "hip" and vision != "no":
-            raise ToolError("images are not available on the AMD backend yet: use vision=no")
+        # the AMD engine, as setup chooses it: asked for, or the only kind of card that can run Strata here
+        hip = backend == "hip" or (backend in (None, "auto") and bool(usable)
+                                   and all(g.get("vendor") == "amd" for g in usable))
+        if hip and WIN and gpus is not None:
+            raise ToolError("several AMD cards sharing one model (gpus) is Linux-only for now: use one card (gpu)")
+        if hip and vision in ("yes", "gpu", "cpu") and s.amd_images(vision) == "none":
+            if s.amd_images("cpu") == "cpu":
+                raise ToolError("an AMD card has no GPU image encoder yet: use vision=cpu (images are read on the "
+                                "CPU) or vision=no")
+            raise ToolError("images are not available with an AMD card on " + ("Windows" if WIN else "this system")
+                            + " yet: use vision=no")
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
         tag = (families[family].get("tag", "") + model)
         have_dir = target / "models" / tag

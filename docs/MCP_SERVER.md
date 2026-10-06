@@ -130,6 +130,11 @@ Every result is JSON with a one-line `summary`. It is sent both as text and as M
 - the context setup recommends for the GPU's VRAM;
 - images off.
 
+AMD cards are planned by setup's own rules (it asks `setup.py` what `--vision` gives on an AMD card, and lists the
+AMD cards on Windows the way setup does). On Linux `vision: cpu` reads images on the CPU. On Windows it plans the
+ready-made AMD engine: one card, no images for now. `vision: yes` or `gpu` on an AMD card is refused with what to use
+instead, because setup would only switch images off. See [AMD_HIP.md](AMD_HIP.md).
+
 The first call returns the plan: the download size (58-111 GB), the free disk space, the RAM check, and the exact
 setup command. The assistant should show you the plan and call again with `confirm: true` once you agree.
 

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -142,6 +143,8 @@ def wait_for(cond, seconds=30.0):
 FAKE_HW = {"os": "TestOS 1", "ram_gb": 64.0, "cpu": {"name": "Fake CPU", "cores": 12, "avx2": True, "avx512": True},
            "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "arch": "120", "vendor": "nvidia",
                      "problem": None, "usable": True}]}
+AMD_HW = {**FAKE_HW, "gpus": [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 15.9, "arch": "gfx1201",
+                                "vendor": "amd", "problem": None, "usable": True}]}
 
 
 class FakeRoot(unittest.TestCase):
@@ -393,6 +396,61 @@ class Install(FakeRoot):
         self.assertEqual(res["install"]["result"], "failed")
         self.assertIn("not enough free disk space - use --models-dir on a bigger drive", res["install"]["error"])
 
+    def plan(self, win, hw, **args):
+        """An install plan (confirm left out: nothing starts) as a Linux or a Windows PC with this hardware:
+        (the setup command or the error, isError)."""
+        self.strata._hardware = lambda: dict(hw)
+        self.strata._hw_cache = None                    # the hardware check is kept for 10 minutes
+        with mock.patch.object(M, "WIN", win):
+            res, err = self.call("strata_install", {"model": "IQ2_XS", **args})
+        self.assertIsNone(self.strata.install_job())
+        self.assertFalse((self.root / "setup-args.json").exists())
+        return (res["error"] if err else res["plan"]["setup_command"]), err
+
+    def test_amd_plans_follow_setup(self):
+        """#990: the plan allows what setup itself does with an AMD card - images on the CPU on Linux, text on
+        Windows - and still refuses what setup would only switch off."""
+        cmd, err = self.plan(False, AMD_HW, backend="hip", vision="cpu")           # Linux: the CPU encoder (0.1.32)
+        self.assertFalse(err, cmd)
+        self.assertIn("--vision cpu", cmd)
+        self.assertTrue(cmd.startswith("./setup.sh ") and cmd.endswith("--backend hip"), cmd)
+        for vision in ("yes", "gpu"):                                              # no GPU encoder: say what works
+            msg, err = self.plan(False, AMD_HW, backend="hip", vision=vision)
+            self.assertTrue(err, msg)
+            self.assertIn("vision=cpu", msg)
+        cmd, err = self.plan(True, AMD_HW, backend="hip")                          # Windows: text (0.1.34)
+        self.assertFalse(err, cmd)
+        self.assertTrue(cmd.startswith("START-HERE.bat ") and "--vision no" in cmd and "--backend hip" in cmd, cmd)
+        for vision in ("yes", "gpu", "cpu"):                                       # Windows: no image encoder yet
+            msg, err = self.plan(True, AMD_HW, backend="hip", vision=vision)
+            self.assertTrue(err, msg)
+            self.assertIn("images are not available with an AMD card on Windows", msg)
+        msg, err = self.plan(True, AMD_HW, backend="hip", gpus="0,1")              # setup stops there too
+        self.assertTrue(err, msg)
+        self.assertIn("Linux-only", msg)
+        cmd, err = self.plan(False, AMD_HW, backend="hip", gpus="0,1", vision="cpu")
+        self.assertFalse(err, cmd)
+
+    def test_amd_is_recognized_without_backend(self):
+        """An AMD-only PC gets the AMD engine from setup without --backend, so the image rule holds there too; a PC
+        with an NVIDIA card keeps the GPU encoder unless hip is asked for."""
+        for backend in ({}, {"backend": "auto"}):
+            msg, err = self.plan(False, AMD_HW, vision="yes", **backend)
+            self.assertTrue(err, msg)
+            self.assertIn("vision=cpu", msg)
+            cmd, err = self.plan(False, AMD_HW, vision="cpu", **backend)
+            self.assertFalse(err, cmd)
+            self.assertNotIn("--backend", cmd)
+        both = {**AMD_HW, "gpus": FAKE_HW["gpus"] + [{**AMD_HW["gpus"][0], "index": 1}]}
+        for hw in (FAKE_HW, both):
+            cmd, err = self.plan(False, hw, vision="yes")
+            self.assertFalse(err, cmd)
+            self.assertIn("--vision yes", cmd)
+        msg, err = self.plan(False, both, backend="hip", vision="yes")
+        self.assertTrue(err, msg)
+        cmd, err = self.plan(False, both, backend="cuda", vision="yes")
+        self.assertFalse(err, cmd)
+
     def test_disk_space_is_checked(self):
         self.strata.disk_free = lambda p: 10.0
         res, err = self.call("strata_install", {"model": "Q2_0"})
@@ -570,6 +628,55 @@ class Helpers(unittest.TestCase):
         self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, False))
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
+
+    def test_amd_image_rule_is_setups(self):
+        """#990: the plan's AMD image rule is setup.py's hip_vision (asked as both systems), and the rule built in
+        for a setup.py that does not import says the same."""
+        s = M.Strata(HERE.parent)
+        S = s.setup_module()
+        bare = M.Strata(HERE.parent)
+        bare._setup_tried = True                        # as if setup.py did not import
+        for win in (False, True):
+            with mock.patch.object(M, "WIN", win), mock.patch.object(S, "WIN", win), \
+                    mock.patch.object(S, "warn", lambda msg: None):
+                for asked in ("no", "yes", "gpu", "cpu", None):
+                    self.assertEqual(s.amd_images(asked), S.hip_vision(asked), (win, asked))
+                    self.assertEqual(bare.amd_images(asked), S.hip_vision(asked), (win, asked))
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):     # setup's warning stays out of the protocol stream
+            self.assertEqual(s.amd_images("yes"), "none")
+        self.assertEqual(out.getvalue(), "")
+
+    def test_amd_cards_are_listed_on_windows(self):
+        """#990: on Windows the hardware check lists AMD cards (setup's own list of display adapters) and the
+        recommendation is the AMD engine; a card Strata does not run is named with setup's reason."""
+        s = M.Strata(HERE.parent)
+        S = s.setup_module()
+        card = {"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 15.93, "arch": "gfx1201", "driver": "32.0",
+                "vendor": "amd", "pci_id": 0x7550}
+        igpu = {**card, "name": "AMD Radeon(TM) 890M Graphics", "vram_gb": 0.5, "arch": "gfx1150"}
+        seen = []
+        for cards in ([card], [igpu]):
+            with mock.patch.object(M, "WIN", True), mock.patch.object(S, "WIN", True), \
+                    mock.patch.object(S, "gpus", lambda: []), \
+                    mock.patch.object(S, "amd_gpus_windows", lambda cards=cards: [dict(g) for g in cards]), \
+                    mock.patch.object(S, "amd_gpus", lambda *a: self.fail("the engine's probe was run")), \
+                    mock.patch.object(S, "page_file_gb", lambda: 0.0), mock.patch.object(S, "ram_gb", lambda: 64.0), \
+                    mock.patch.object(M, "windows_video_controllers", lambda: [{"name": cards[0]["name"]}]):
+                hw = s._hardware()
+                seen.append((hw, s.recommend(hw)))
+        (hw, rec), (hw2, rec2) = seen
+        self.assertEqual([(g["vendor"], g["usable"], g["vram_gb"]) for g in hw["gpus"]], [("amd", True, 15.9)])
+        self.assertEqual((rec["backend"], rec["model"]), ("hip", "IQ3_XXS"))
+        self.assertTrue(rec["setup_command"].startswith("START-HERE.bat ") and
+                        rec["setup_command"].endswith("--backend hip"), rec["setup_command"])
+        self.assertIn("ready-made AMD engine", rec["notes"][-1])
+        self.assertIn("no images", rec["notes"][-1])
+        self.assertFalse(hw2["gpus"][0]["usable"])
+        self.assertIsNone(rec2["model"])
+        self.assertIn("890M", rec2["why"])
+        self.assertIn("gfx1150", rec2["why"])
+        self.assertNotIn("Linux only", rec2["why"])
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
