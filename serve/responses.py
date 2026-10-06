@@ -191,6 +191,9 @@ def input_messages(req: dict) -> list[dict]:
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
+        elif kind == "additional_tools":             # #782: tool definitions, read by request_tools; no message
+            if not isinstance(item.get("tools"), list):
+                raise ResponsesError("an additional_tools item needs a tools array", param + ".tools")
         elif kind == "item_reference":
             raise ResponsesError("item references need stored responses, and this server keeps none: send the items "
                                  "themselves", param, "unsupported_parameter")
@@ -232,11 +235,22 @@ def _order_tool_results(messages):
 
 
 def request_tools(req: dict):
-    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
+    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out).
+
+    The tools are `tools` and then those of the `additional_tools` input items, in order (#782: newer Codex sends its
+    tools there, with no `tools` at all, and appends an item when its tools change).  A tool defined again replaces
+    the earlier definition in its place, and a namespace keeps the description it was first declared with (a later
+    item's is Codex's note that the item is an update, not a description of the tools)."""
     tools, names, skipped = [], {}, []
     given = req.get("tools") or []
     if not isinstance(given, list):
         raise ResponsesError("tools must be an array", "tools")
+    given = [(f"tools[{i}]", tool) for i, tool in enumerate(given)]
+    items = req.get("input")
+    for i, item in enumerate(items if isinstance(items, list) else []):
+        if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
+            given += [(f"input[{i}].tools[{j}]", tool) for j, tool in enumerate(item["tools"])]
+    place, ns_descriptions = {}, {}                  # template name -> its index in tools; namespace -> description
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
@@ -255,26 +269,30 @@ def request_tools(req: dict):
                 description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
             params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
                       "required": ["input"]}
-        tools.append({"name": flat, "description": description, "parameters": params})
+        tool = {"name": flat, "description": description, "parameters": params}
+        if flat in place:
+            tools[place[flat]] = tool
+        else:
+            place[flat] = len(tools)
+            tools.append(tool)
         names[flat] = (namespace, name, kind)
         if namespace:
             # Qwen writes Codex's MCP tools as `mcp__server__tool` (the flat name it
             # learned), not `mcp__server.tool`: map that spelling back as well.
             names.setdefault(f"{namespace}__{name}", (namespace, name, kind))
 
-    for i, tool in enumerate(given):
-        param = f"tools[{i}]"
+    for param, tool in given:
         if not isinstance(tool, dict):
             raise ResponsesError("expected a tool object", param)
         kind = tool.get("type")
         if kind in ("function", "custom"):
             add(tool, param)
         elif kind == "namespace":
+            ns_description = ns_descriptions.setdefault(str(tool.get("name")), tool.get("description") or "")
             for j, member in enumerate(tool.get("tools") or []):
                 if not isinstance(member, dict) or member.get("type", "function") not in ("function", "custom"):
                     raise ResponsesError("a namespace holds function tools", f"{param}.tools[{j}]")
-                add({"type": "function", **member}, f"{param}.tools[{j}]", tool.get("name"),
-                    tool.get("description") or "")
+                add({"type": "function", **member}, f"{param}.tools[{j}]", tool.get("name"), ns_description)
         elif kind in HOSTED_TOOLS or isinstance(kind, str):
             skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
         else:

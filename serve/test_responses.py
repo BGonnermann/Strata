@@ -115,6 +115,49 @@ class Parsing(unittest.TestCase):
         self.assertEqual(skipped, ["web_search"])
         self.assertIsNone(request_tools({"tools": TOOLS, "tool_choice": "none"})[0])
 
+    def test_additional_tools_items(self):
+        """#782: newer Codex sends its tools as `additional_tools` input items (no `tools`), and appends an item when
+        they change.  They are tools, not messages; a tool defined again replaces the earlier one in its place."""
+        ns = {"type": "namespace", "name": "mcp_fs", "description": "Files.", "tools": [
+            {"type": "function", "name": "read", "description": "Reads.", "parameters": {"type": "object"}},
+            {"type": "function", "name": "write", "description": "Writes.", "parameters": {"type": "object"}}]}
+        first = {"type": "additional_tools", "role": "developer", "tools": [ns, *TOOLS, {"type": "tool_search"}]}
+        base = [first, {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "I"}]},
+                {"role": "user", "content": "go"}]
+        self.assertEqual(input_messages({"input": base}),
+                         [{"role": "system", "content": "I"}, {"role": "user", "content": "go"}])
+        tools, names, skipped = request_tools({"input": base})
+        self.assertEqual([t["name"] for t in tools], ["mcp_fs.read", "mcp_fs.write", "exec_command"])
+        self.assertEqual(names["mcp_fs.read"], ("mcp_fs", "read", "function"))
+        self.assertEqual(skipped, ["tool_search"])
+        # the same tools as `tools` give the same template tools: the prompt is the one the old form made
+        self.assertEqual(tools, request_tools({"input": "go", "tools": first["tools"]})[0])
+
+        update = {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+            {"type": "namespace", "name": "mcp_fs", "description": "This is an incremental namespace update.",
+             "tools": [{"type": "function", "name": "read", "description": "Reads better.",
+                        "parameters": {"type": "object"}}]},
+            {"type": "function", "name": "new_tool", "parameters": {"type": "object"}}]}
+        later = [*base, {"role": "assistant", "content": "ok"}, update, {"role": "user", "content": "more"}]
+        self.assertEqual([m["role"] for m in input_messages({"input": later})],
+                         ["system", "user", "assistant", "user"])
+        tools, names, _ = request_tools({"input": later})
+        self.assertEqual([t["name"] for t in tools], ["mcp_fs.read", "mcp_fs.write", "exec_command", "new_tool"])
+        self.assertEqual(tools[0]["description"], "Files.\n\nReads better.")     # the namespace's own description
+        self.assertEqual(tools[1]["description"], "Files.\n\nWrites.")
+        # `tools` and the items together: `tools` first
+        tools, _, _ = request_tools({"tools": TOOLS, "input": [update, {"role": "user", "content": "go"}]})
+        self.assertEqual([t["name"] for t in tools], ["exec_command", "mcp_fs.read", "new_tool"])
+        self.assertIsNone(request_tools({"input": base, "tool_choice": "none"})[0])
+        for bad, param in (({"type": "additional_tools"}, "input[0].tools"),
+                           ({"type": "additional_tools", "tools": {"name": "x"}}, "input[0].tools")):
+            with self.assertRaises(ResponsesError) as e:
+                input_messages({"input": [bad, {"role": "user", "content": "go"}]})
+            self.assertEqual(e.exception.param, param)
+        with self.assertRaises(ResponsesError) as e:
+            request_tools({"input": [{"type": "additional_tools", "tools": [{"type": "function"}]}]})
+        self.assertEqual(e.exception.param, "input[0].tools[0].name")
+
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}, {}), {"enable_thinking": False})
         self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}, {}), {"reasoning_effort": "xhigh"})
@@ -392,6 +435,29 @@ class ToolRoundTrip(Server):
                                           "output": "2"}]})
         self.assertEqual([c["function"]["name"] for c in msgs[1]["tool_calls"]],
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
+
+
+class AdditionalTools(Server):
+    script = CALL
+
+    def test_a_request_with_its_tools_in_the_input(self):
+        """#782: Codex's request without `tools` and `instructions` (it was a 400 naming `additional_tools`)."""
+        body = {"model": "m", "store": False, "input": [
+            {"type": "additional_tools", "role": "developer", "tools": TOOLS},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Use the tools."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a.txt"}]}]}
+        code, r = self.post(body)
+        self.assertEqual(code, 200, r)
+        call = r["output"][-1]
+        self.assertEqual((call["type"], call["name"], json.loads(call["arguments"])),
+                         ("function_call", "exec_command", {"cmd": "cat a.txt"}))
+        code, events = self.post({**body, "stream": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(events[-1]["response"]["output"][-1]["name"], "exec_command")
+        prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertIn("Runs a command.", prompt)        # the model was shown the tool
+        self.assertIn("Use the tools.", prompt)
 
 
 if __name__ == "__main__":
