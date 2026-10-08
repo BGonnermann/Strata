@@ -517,6 +517,7 @@ function blocks(text) {
         let j = i + 1;
         while (j < lines.length && !lines[j].trim()) j++;
         if (j === lines.length || !(list.tag === "ol" ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/).test(lines[j])) flushList();
+        i = j - 1;                        // the blank lines were already read; visit the next non-blank line once
       }
       continue;
     }

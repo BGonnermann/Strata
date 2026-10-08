@@ -23,12 +23,12 @@ process.stdout.write(JSON.stringify(texts.map(markdown)));
 """
 
 
-def render(texts: list[str]) -> list[str]:
+def render(texts: list[str], *, timeout: float = 60) -> list[str]:
     js = APP.read_text(encoding="utf-8")
     esc = next(line for line in js.splitlines() if line.startswith("const esc = "))
     part = js[js.index("function inline(s)"):js.index("// ------------------------------------------------------------------ Chat")]
     r = subprocess.run([NODE, "-e", esc + "\n" + part + RUN], input=json.dumps(texts), capture_output=True,
-                       text=True, encoding="utf-8", timeout=60)
+                       text=True, encoding="utf-8", timeout=timeout)
     if r.returncode != 0:
         raise AssertionError(r.stderr)
     return json.loads(r.stdout)
@@ -50,6 +50,15 @@ class Lists(unittest.TestCase):
                          "<li><strong>Cut screen time</strong> Blue light.</li></ol>")
         self.assertEqual(self.html("- a\n\n- b\n\n* c"), "<ul><li>a</li><li>b</li><li>c</li></ul>")
         self.assertEqual(self.html("1. a\n2. b"), "<ol><li>a</li><li>b</li></ol>")      # a tight list: as before
+
+    def test_a_long_run_of_blank_lines_does_not_stall_rendering(self):
+        """Skipping blank lines must not scan the same run again for each line."""
+        text = "1. a\n" + "\n" * 100_000 + "2. b"
+        try:
+            html = render([text], timeout=5)[0]
+        except subprocess.TimeoutExpired:
+            self.fail("100,000 blank lines between items took over five seconds to render")
+        self.assertEqual(html, "<ol><li>a</li><li>b</li></ol>")
 
     def test_a_blank_line_still_ends_a_list_before_anything_else(self):
         cases = {"1. a\n\ntext": "<ol><li>a</li></ol><p>text</p>",
